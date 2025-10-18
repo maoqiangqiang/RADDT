@@ -1,0 +1,33 @@
+
+# ignore mac .DS_Store 
+.DS_Store 
+*.DS_Store
+
+# ignore .vscode
+.vscode
+
+# ignore dataset 
+# data/
+
+
+*.log
+*.out
+# *.csv
+*.xlsx
+# *.txt
+*.ipynb
+
+*__pycache__/
+__pycache__
+
+*.err
+
+
+
+*.json
+*.jpeg  
+
+
+
+
+*.tensorboard/
