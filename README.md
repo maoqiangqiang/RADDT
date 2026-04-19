@@ -14,9 +14,26 @@ It supports both regression and classification tasks. For detailed information o
 
 
 
-Features in this version:
+## Repository Overview
 
-This repository provides the source code for the `RADDT` algorithm, including both single-GPU/CPU and distributed multi-GPU versions.
+This repository contains the source code for the `RADDT` algorithm. To support various use cases and hardware configurations, the codebase is organized into the following branches:
+
+- `regression`: Designed for regression tasks. Supports single-GPU or CPU execution.
+
+- `classification`: Designed for classification tasks. Supports single-GPU or CPU execution.
+
+- `multi-GPU`: Designed for regression tasks, adapted for distributed multi-GPU training using the Distributed Data Parallel (DDP) strategy.
+
+
+
+## Current Branch: `regression`
+You are currently on the `regression` branch.
+
+- Supported Task: Regression
+- Hardware: Single-GPU or CPU
+
+
+
 
 We are currently working on wrapping up the code into a more organized and user-friendly interface like pip package. Stay tuned for updates!
 
