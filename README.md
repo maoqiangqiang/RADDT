@@ -78,7 +78,7 @@ python .\test\test_RADDT.py 3 3 1 1 2 3000 "cuda" 10 5
 For distributed multi-GPU computing, please refer to the job submission script in the `sh_narval_MultiGPU` folder within `multi-gpu` branch for an example of running on the "Narval" cluster in Computer Canada.
 
 ## Others 
-If you encounter any errors or notice unexpected tree performance, please don't hesitate to contact us.
+If you encounter any errors or notice unexpected tree performance, please don't hesitate to contact us (maoq@student.ubc.ca).
 
 ## License
 This repository is published under the terms of the `GNU General Public License v3.0 `. 
