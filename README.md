@@ -66,7 +66,7 @@ If you require some specific features not included in the current release, pleas
 
 - `sh_narval_MultiGPU` folder contains job submission script for running experiments on the "Narval" cluster in Computer Canada. This version utilizes the Distributed Data Parallel (DDP) strategy using multi-GPUs (e.g. eight GPUs in the example).
 
-We release the source code in two versions, located in separate folders: `singleGPUorCPUVersion` and `distributedMultiGPUVersion`. The scripts are nearly identical, but the `distributedMultiGPUVersion` is adapted for multi-GPU training using the Distributed Data Parallel (DDP) strategy. Scripts modified for this purpose are distinguished by a "_DDP" suffix.
+We release the source code in several different branches. The scripts are nearly identical, but the `multi-gpu` branch is adapted for multi-GPU training using the Distributed Data Parallel (DDP) strategy. Scripts modified for this purpose are distinguished by a "_DDP" suffix.
 
 
 ## Usage Example
@@ -76,7 +76,7 @@ The examples for single GPU/CPU computing can be implemented via:
 python .\test\test_RADDT.py 3 3 1 1 2 3000 "cuda" 10 5
 ```
 
-For distributed multi-GPU computing, please refer to the job submission script in the `sh_narval_MultiGPU` folder for an example of running on the "Narval" cluster in Computer Canada.
+For distributed multi-GPU computing, please refer to the job submission script in the `sh_narval_MultiGPU` folder within `multi-gpu` branch for an example of running on the "Narval" cluster in Computer Canada.
 
 ## Others 
 If you encounter any errors or notice unexpected tree performance, please don't hesitate to contact us.
