@@ -22,7 +22,7 @@ This repository contains the source code for the `RADDT` algorithm. To support v
 
 - `classification`: Designed for classification tasks. Supports single-GPU or CPU execution.
 
-- `multi-GPU`: Designed for regression tasks, adapted for distributed multi-GPU training using the Distributed Data Parallel (DDP) strategy.
+- `multi-gpu`: Designed for regression tasks, adapted for distributed multi-GPU training using the Distributed Data Parallel (DDP) strategy.
 
 
 
