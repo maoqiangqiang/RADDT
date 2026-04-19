@@ -3,15 +3,17 @@ import numpy as np
 import pandas as pd
 import time
 import json
+import sklearn.metrics as metrics
 
 import sys
 sys.path.append('./src/')
 
-from dataset import loadDataset 
-from treeFunc import readTreePath, objv_cost
 
-from warmStart import CARTRegWarmStart
+from dataset import loadDataset
+from warmStart import CARTClfWarmStart
+from treeFunc import readTreePath, getPredY
 from RADDT import  multiStartTreeOptbyGRAD_withC
+
 
 
 if __name__ == "__main__":
@@ -25,8 +27,7 @@ if __name__ == "__main__":
     dataNumEnd = int(sys.argv[2])                   # e.g. 1
     runsNumStart = int(sys.argv[3])                 # e.g. 1
     runsNumEnd = int(sys.argv[4])                   # e.g. 1
-    
-    # tree depth 
+
     treeDepth = int(sys.argv[5])                    # e.g. 2 4 8 
     epochNum = int(sys.argv[6])                     # e.g. 1000; larger than 21 epoch 
     deviceArg =  str(sys.argv[7])                   # "cuda" or "cpu"
@@ -35,22 +36,17 @@ if __name__ == "__main__":
     numScale = int(sys.argv[9])                     # e.g. 1, 2, 3, 4, 5...
 
 
-    ##  data
-    datasetPath = "../data/"
-    # all datasets (all n>1000)
-    DatasetsNames = ["airfoil-self-noise", "space-ga", "abalone", "gas-turbine-co-emission-2015", "gas-turbine-nox-emission-2015",  "puma8NH",  "cpu-act", "cpu-small", "kin8nm", "delta-elevators", "combined-cycle-power-plant", "electrical-grid-stability", "condition-based-maintenance_compressor", "condition-based-maintenance_turbine", "ailerons", "elevators", "friedman-artificial"]
 
+    datasetPath = "./data/"
+    DatasetsNames = ["banknote-authentication"]
 
-    # read the treePath from the HDF5 file
-    indices_flags_dict = readTreePath(treeDepth, device)
-
+    
     datasetNum = len(DatasetsNames)
     print("Starting: Total {} datasets".format(datasetNum))
-
-    DDT_Train_Result = np.zeros((datasetNum, 10), dtype=np.float32)
-    DDT_Test_Result = np.zeros((datasetNum, 10), dtype=np.float32)
-    DDT_Time = np.zeros((datasetNum, 10), dtype=np.float32)
-
+    
+    
+    # read the treePath from the HDF5 file
+    indices_flags_dict = readTreePath(treeDepth, device)
 
 
     for datasetIdx in range(dataNumStart-1, dataNumEnd):
@@ -60,14 +56,14 @@ if __name__ == "__main__":
             torch.manual_seed(run)
             np.random.seed(run)
 
-            dataTrain, dataValid, dataTest = loadDataset(DatasetsNames[datasetIdx], run, datasetPath)
-            p = dataTrain.shape[1] - 1
-            X_train = torch.from_numpy(dataTrain[:, 0:p] * 1.0).float()
-            Y_train = torch.from_numpy(dataTrain[:, p] * 1.0).float()
-            X_valid = torch.from_numpy(dataValid[:, 0:p] * 1.0).float()
-            Y_valid = torch.from_numpy(dataValid[:, p] * 1.0).float()
-            X_test = torch.from_numpy(dataTest[:, 0:p] * 1.0).float()
-            Y_test = torch.from_numpy(dataTest[:, p] * 1.0).float()
+            data_train, data_valid, data_test = loadDataset(DatasetsNames[datasetIdx], run, datasetPath)
+            p = data_train.shape[1] - 1
+            X_train = torch.from_numpy(data_train[:, 0:p] * 1.0).float()
+            Y_train = torch.from_numpy(data_train[:, p]).long()
+            X_valid = torch.from_numpy(data_valid[:, 0:p] * 1.0).float()
+            Y_valid = torch.from_numpy(data_valid[:, p]).long()
+            X_test = torch.from_numpy(data_test[:, 0:p] * 1.0).float()
+            Y_test = torch.from_numpy(data_test[:, p]).long()
             X = torch.cat((X_train, X_valid), 0)
             Y = torch.cat((Y_train, Y_valid), 0)
             X = X.to(device, non_blocking=True)
@@ -78,34 +74,41 @@ if __name__ == "__main__":
             # Y_valid = Y_valid.to(device, non_blocking=True)
             X_test = X_test.to(device, non_blocking=True)
             Y_test = Y_test.to(device, non_blocking=True)
+            # X_all = torch.cat((X, X_test), 0)
+            Y_all = torch.cat((Y, Y_test), 0)
 
             if run == runsNumStart:
                 print("dataset:{};    n_train:{};    n_valid:{};    n_test:{};    p:{}\n".format(DatasetsNames[datasetIdx], X_train.shape[0], X_valid.shape[0], X_test.shape[0], X_train.shape[1]))
 
-            startTime = time.perf_counter()
 
+            startTime = time.perf_counter()
+            
+            nClass = torch.unique(Y_all).shape[0]
+            print(f"nClass: {nClass}")
             # cart warm start
-            aInit, bInit, cInit = CARTRegWarmStart(X, Y, treeDepth, device)
+            aInit, bInit, cInit = CARTClfWarmStart(X, Y, treeDepth, nClass, device)
             cartWarmStart_dict = {"a": aInit, "b": bInit, "c": cInit}
             warmStart = [cartWarmStart_dict]
-            objv_DDTCur, treeDDTCur = multiStartTreeOptbyGRAD_withC(X, Y, treeDepth, indices_flags_dict, epochNum, device, warmStart, startNum, numScale)
-
-
-            objvMseTrainDDT, r2TrainDDT = objv_cost(X, Y, treeDepth, treeDDTCur)
-            objvMseTestDDT, r2TestDDT = objv_cost(X_test, Y_test, treeDepth, treeDDTCur)
-
-
+            acc_DDTCur, treeDDTCur = multiStartTreeOptbyGRAD_withC(X, Y, treeDepth, nClass, indices_flags_dict, epochNum, device, warmStart, startNum, numScale)
 
             elapsedTime = time.perf_counter() - startTime
 
-
-
+            # get the predY
+            Y_Pred = getPredY(X, Y, treeDepth, treeDDTCur)
+            Y_Prednp = Y_Pred.cpu().numpy()
+            Y_test_Pred = getPredY(X_test, Y_test, treeDepth, treeDDTCur)
+            Y_test_Prednp = Y_test_Pred.cpu().numpy()
+            Y_np = Y.cpu().numpy()
+            Y_test_np = Y_test.cpu().numpy()
+    
+            acc_train = metrics.accuracy_score(Y_np, Y_Prednp)
+            acc_test = metrics.accuracy_score(Y_test_np, Y_test_Prednp)
+            f1_train = metrics.f1_score(Y_np, Y_Prednp, average='macro')
+            f1_test = metrics.f1_score(Y_test_np, Y_test_Prednp, average='macro')
 
             ## final results
             print("\nFinal Results...")
-            print("objvMseTrainDDT: {};   r2TrainDDT: {}".format(objvMseTrainDDT, r2TrainDDT))
-            print("objvMseTestDDT: {};   r2TestDDT: {}".format(objvMseTestDDT, r2TestDDT))
-
-            print("elapsedTimeCV: {}".format(elapsedTime))
+            print("acc_train: {};   acc_test: {};   f1_train: {};   f1_test: {}".format(acc_train, acc_test, f1_train, f1_test))
+            print("elapsedTime: {}".format(elapsedTime))
 
 

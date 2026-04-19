@@ -10,30 +10,39 @@ from sklearn.svm import LinearSVC
 sys.path.append('./src/')
 
 
-# jit version of update_c 
-#  tree: Dict[str, torch.Tensor] does not allow any int type value (only tensor tyoe value). 
+def onehot_coding(target, device, output_dim):
+    """Convert the class labels into one-hot encoded vectors."""
+    target_onehot = torch.FloatTensor(target.size()[0], output_dim).to(device)
+    target_onehot.data.zero_()
+    target_onehot.scatter_(1, target.view(-1, 1), 1.0)
+    return target_onehot
+
+
+
+
 @torch.jit.script
-def update_c(X: torch.Tensor, y: torch.Tensor, treeDepth: int, tree: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def update_c(X: torch.Tensor, y: torch.Tensor, treeDepth: int,  tree: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     n, p = X.shape
     Tb = 2 ** treeDepth - 1  # branch node size
     Tleaf = 2 ** treeDepth  # leaf node size
-    miny = torch.min(y)
-    maxy = torch.max(y)
 
     # Initialize c and z
-    c = torch.full([int(Tleaf)], (miny + maxy) / 2, device=X.device)
+    c = torch.zeros(int(Tleaf), device=X.device, dtype=torch.long)
     z = torch.ones(n, device=X.device, dtype=torch.long)
 
     # Calculate the path for each data point in a vectorized manner
     for _ in range(treeDepth):
-        decisions = (tree['a'][z - 1] * X).sum(dim=1) > tree['b'][z - 1] 
+        decisions = (tree['a'][z - 1] * X).sum(dim=1) > tree['b'][z - 1]                         
         z = torch.where(decisions, 2 * z + 1, 2 * z)
 
     z = z - (Tb + 1)
     z = z.to(torch.int64)
     unique_z, counts = torch.unique(z, return_counts=True)
-    sums = torch.zeros_like(c).scatter_add_(0, z, y)
-    c[unique_z] = sums[unique_z] / counts.float()
+
+    for leaf in unique_z:
+        leaf_indices = (z == leaf)
+        c[leaf] = torch.mode(y[leaf_indices]).values
+
     tree['c'] = c
     return tree
 
@@ -41,24 +50,40 @@ def update_c(X: torch.Tensor, y: torch.Tensor, treeDepth: int, tree: Dict[str, t
 
 
 @torch.jit.script
-def objv_cost(X: torch.Tensor, y: torch.Tensor, treeDepth: int, tree: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+def objv_cost(X: torch.Tensor, y: torch.Tensor, treeDepth: int, tree: Dict[str, torch.Tensor]) -> torch.Tensor:
     n, p = X.shape
     Tb = 2 ** treeDepth - 1
     t = torch.ones(n, device=X.device, dtype=torch.long)
 
     for iiii in range(treeDepth):
-        # decisions = (tree['a'][t - 1] * X).sum(dim=1) >= tree['b'][t - 1]
         decisions = (tree['a'][t - 1] * X).sum(dim=1) > tree['b'][t - 1]
         t = torch.where(decisions, 2 * t + 1, 2 * t).long()
 
-    Yhat = tree['c'][(t - (Tb + 1)).long()]
-    # Manual R2 Score computation
-    total_variance = torch.sum((y - torch.mean(y)) ** 2)
-    residual_variance = torch.sum((Yhat - y) ** 2)
-    r2_score = 1 - (residual_variance / total_variance)
+    predicted_labels = tree['c'][(t - (Tb + 1)).long()]  
 
-    # return torch.sum((Yhat - y) ** 2)/n, r2_score
-    return residual_variance/n, r2_score
+    # Compute accuracy
+    correct = (predicted_labels == y).sum().item()  
+    accuracy = correct / n  
+
+    return torch.tensor(accuracy, device=X.device)
+
+@torch.jit.script
+def getPredY(X: torch.Tensor, y: torch.Tensor, treeDepth: int, tree: Dict[str, torch.Tensor]) -> torch.Tensor:
+    n, p = X.shape
+    Tb = 2 ** treeDepth - 1
+    t = torch.ones(n, device=X.device, dtype=torch.long)
+
+    for iiii in range(treeDepth):
+        decisions = (tree['a'][t - 1] * X).sum(dim=1) > tree['b'][t - 1]
+        t = torch.where(decisions, 2 * t + 1, 2 * t).long()
+
+    # Get the predicted class from the leaf node
+    predicted_labels = tree['c'][(t - (Tb + 1)).long()]  
+
+
+    return predicted_labels
+
+
 
 
 
@@ -90,6 +115,7 @@ def treePathCalculation(treeDepth, Data_device):
         ancestors = torch.as_tensor(ancestors, device= Data_device)
         ancestors_shifted = ancestors[1:] + 1
         oddEven = ((-1) ** ancestors_shifted + 1) / 2     # 0 -> I1, 1 -> (1-I1)
+
         ancestorIdxTemp = [(ancestors[ancestorIdx]-1).cpu().numpy().item() for ancestorIdx in range(len(ancestors)-1)]
         oddEvenTemp = [bool(element) for element in ((1- oddEven))]                     # 0/False -> (1-I1), 1/True -> I1
 
@@ -129,11 +155,7 @@ def readTreePath(treeDepth, device):
             'flags_tensor': flags_tensor_long
         }
 
-    # print(indices_flags_dict.keys())
     return indices_flags_dict
-
-
-
 
 
 
@@ -147,7 +169,7 @@ def sampleAssignCal(X: torch.Tensor, aMatrix: torch.Tensor, bVector: torch.Tenso
     z = torch.ones(n, dtype=torch.long, device=X.device)  # Node indices
     indices = torch.arange(n, device=X.device)  # Pre-compute indices
     sampleAlloc[indices, z - 1] = True 
-    
+
     for _ in range(treeDepth - 1):
         decisions = (aMatrix[z - 1] * X).sum(dim=1) > bVector[z - 1]
         z = torch.where(decisions, 2 * z + 1, 2 * z)
@@ -158,21 +180,22 @@ def sampleAssignCal(X: torch.Tensor, aMatrix: torch.Tensor, bVector: torch.Tenso
 
 
 
-### compare the efficacy of adjustB and adjustBbySVM
+
 def abjustA_b_Compr(X, aMatrix, bVector, MultiAbFlag):
     sampleAlloc = sampleAssignCal(X, aMatrix, bVector)
     Tb = aMatrix.shape[0] 
     negBVectorAdjust = torch.zeros(Tb, device=X.device, dtype=torch.float32)
     aMatrixAdjust = torch.ones_like(aMatrix)
     for t in range(Tb):
-
         sampleAlloc_t = sampleAlloc[:, t]
         n_t = sampleAlloc_t.sum().item()  
         if n_t <= 1:
             negBVectorAdjust[t] = -bVector[t]
             aMatrixAdjust[t, :] = aMatrix[t, :]
             continue
+
         X_t = X[sampleAlloc_t, :]
+
         ## Method 1: only abjust b with minor changes
         aVect = aMatrix[t, :]
         bt = bVector[t]
@@ -197,6 +220,7 @@ def abjustA_b_Compr(X, aMatrix, bVector, MultiAbFlag):
             aMatrixAdjust[t, :] = aVect
             continue
 
+
         # using SVM to adjust both a and b
         X_tCPU = X_t.cpu()
         pseudoY_tCPU = pseudoY_t.cpu()
@@ -207,13 +231,13 @@ def abjustA_b_Compr(X, aMatrix, bVector, MultiAbFlag):
         score = SVCModel.score(X_tCPU, pseudoY_tCPU)
         aVectbySVM = torch.tensor(SVCModel.coef_[0], device=X.device, dtype=torch.float32)
         negB_tbySVM = SVCModel.intercept_[0]
-
         norm_aVectbySVM = torch.norm(aVectbySVM, p=2)
         aVectbySVM = aVectbySVM / norm_aVectbySVM
         negB_tbySVM = negB_tbySVM / norm_aVectbySVM
 
         min_d_method1 = torch.min(torch.abs(ax_t + negAdjustB_t))
         ax_tbySVM = torch.matmul(X_t, aVectbySVM)
+        
         min_d_method2 = torch.min(torch.abs(ax_tbySVM + negB_tbySVM))
         dThreshold = 0.05
         if min_d_method1 >= min_d_method2:
@@ -232,24 +256,6 @@ def abjustA_b_Compr(X, aMatrix, bVector, MultiAbFlag):
                 aMatrixAdjust[t, :] = aVectbySVM * multiFactor
 
     return aMatrixAdjust, negBVectorAdjust
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

@@ -4,20 +4,21 @@ import math
 import sys 
 sys.path.append('./src/')
 
-from warmStart import CARTRegWarmStart
-from treeFunc import objv_cost, update_c, abjustA_b_Compr
+from treeFunc import objv_cost, update_c, abjustA_b_Compr, onehot_coding
 
 from modifiedScheduler import ChainedScheduler
 import numpy as np
 
-import os 
-##  enforce deterministic behavior in PyTorch
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-torch.use_deterministic_algorithms(True)
-os.environ["CUBLAS_WORKSPACE_CONFIG"]=":4096:8"
 
-# from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import TensorDataset, DataLoader
+
+# import os 
+# ##  enforce deterministic behavior in PyTorch
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = False
+# torch.use_deterministic_algorithms(True)
+# os.environ["CUBLAS_WORKSPACE_CONFIG"]=":4096:8"
+
 
 
 
@@ -36,7 +37,10 @@ class branchNodeNet(torch.nn.Module):
             self.linear1.weight = torch.nn.Parameter(a_init.clone().detach().requires_grad_(True))
         if b_init is not None:
             self.linear1.bias = torch.nn.Parameter(b_init.clone().detach().requires_grad_(True))
+        # Define a ReLU layer
         self.relu = torch.nn.ReLU()
+
+        # leaf labels as trainable parameters 
         if c_init is not None:
             self.c_leafLable = torch.nn.Parameter(c_init.clone().detach().requires_grad_(True))
         else:
@@ -46,26 +50,34 @@ class branchNodeNet(torch.nn.Module):
         x = self.linear1(x)
         reluBMinusAx = self.relu(-x)
         reluAxMinusB = self.relu(x)
+        # Return both the branch node results and the trainable leaf labels
         return reluBMinusAx, reluAxMinusB, self.c_leafLable
 
 
-## the version of matrix operation and broadcasting
-@torch.jit.script
-def objectiveFuncwithC(scale: float, reluBMinusAx: torch.Tensor, reluAxMinusB: torch.Tensor, Y_train: torch.Tensor, c_leafLable: torch.Tensor,  treeDepth: int, indices_tensor: torch.Tensor, flags_tensor: torch.Tensor, batch_size: int) -> torch.Tensor: 
+
+def objectiveFuncwithC(scale: float, reluBMinusAx: torch.Tensor, reluAxMinusB: torch.Tensor, Y_train: torch.Tensor, c_leafLabel: torch.Tensor,  treeDepth: int, indices_tensor: torch.Tensor, flags_tensor: torch.Tensor, batch_size: int) -> torch.Tensor: 
 
     N_num = Y_train.shape[0]
     total_objv = torch.tensor(0.0, device=reluBMinusAx.device)
+    crossEntropy = torch.nn.CrossEntropyLoss(reduction='none')
+    TL, nClass = c_leafLabel.shape
+
 
     for i in range(0, N_num, batch_size):
         batch_End = min(i+batch_size, N_num)
         batch_Y_train = Y_train[i:batch_End]
-        batch_Y_train_diff = (batch_Y_train.view(-1, 1) - c_leafLable.view(1, -1)).pow_(2)
-        # Stack indicators and their complement
+        numBatchY = batch_Y_train.shape[0]
+
+        c_leafLabel_expanded = c_leafLabel.unsqueeze(0).repeat(numBatchY, 1, 1)         
+        logits_flat = c_leafLabel_expanded.view(-1, nClass)  
+        targets_flat = batch_Y_train.unsqueeze(1).repeat(1, TL).view(-1)  
+        loss_flat = crossEntropy(logits_flat, targets_flat)  
+        batch_loss = loss_flat.view(numBatchY, TL)
+
         indicators_stack = torch.stack((reluBMinusAx[i:batch_End,:], reluAxMinusB[i:batch_End,:]))
-        # Use broadcasting and advanced indexing to select appropriate indicators
         selected_indicators = indicators_stack[flags_tensor, :, indices_tensor]
         indicator_pairs = selected_indicators.sum(dim=1).transpose(0, 1)
-        # add 1 softmax to the Relu-based indicator_pairs
+
         scaleSoftmax = scale
         indicator_pairs = indicator_pairs * scaleSoftmax
         ReluPitSoftmax = torch.nn.functional.softmin(indicator_pairs, dim=1)
@@ -73,7 +85,7 @@ def objectiveFuncwithC(scale: float, reluBMinusAx: torch.Tensor, reluAxMinusB: t
         if treeDepth > 4:
             ReluPitSoftmax = torch.nn.functional.threshold(ReluPitSoftmax, 1.0/(2**treeDepth), 0.0)
 
-        batch_objv = (ReluPitSoftmax * batch_Y_train_diff).sum()
+        batch_objv = (ReluPitSoftmax * batch_loss).sum()
         total_objv += batch_objv
     
     total_objv = total_objv / N_num
@@ -83,7 +95,8 @@ def objectiveFuncwithC(scale: float, reluBMinusAx: torch.Tensor, reluAxMinusB: t
 
 
 
-def initialize_parameters(choice, net, warmStarts, X_train, Y_train, device, MultiAbFlag=False):
+def initialize_parameters(choice, net, warmStarts, X_train, Y_train, nClass, device, MultiAbFlag=False):
+    
     a, b, c = None, None, None
     if choice < len(warmStarts) and warmStarts[choice] is not None:
         ws = warmStarts[choice]
@@ -99,8 +112,10 @@ def initialize_parameters(choice, net, warmStarts, X_train, Y_train, device, Mul
         b = torch.rand(net.linear1.bias.shape, dtype=torch.float32, device=device) * (2.0)+(-1.0)
         aMatrixAdjustCompr, negBVectorAdjustCompr = abjustA_b_Compr(X_train, a, b*(-1.0), MultiAbFlag)
         c = update_c(X_train, Y_train, net.depth, {"a": aMatrixAdjustCompr, "b": negBVectorAdjustCompr})["c"]
+        c = onehot_coding(c, device, nClass)
 
     return aMatrixAdjustCompr, negBVectorAdjustCompr, c
+
 
 
 
@@ -114,13 +129,13 @@ class callbackFuncs:
             treeEpoch = {"a": a_grad, "b": b_grad, "c": c_grad}
             
         treeEpoch = update_c(X_train, Y_train, treeDepth, treeEpoch)
-        objvMSE_Epoch, r2_Epoch = objv_cost(X_train, Y_train, treeDepth, treeEpoch)
-        return objvMSE_Epoch, r2_Epoch, treeEpoch
+        accEpoch = objv_cost(X_train, Y_train, treeDepth, treeEpoch)
+        return accEpoch, treeEpoch
         
 
 
 
-def treeOptbyGRADwithC(treeDepth, indices_flags_dict, epochNum, X_train, Y_train, device, warm_starts, scaleFactor, lrscheList,  idxStart, callback, adjust_ab=False):
+def treeOptbyGRADwithC(treeDepth, nClass, indices_flags_dict, epochNum, X_train, Y_train, device, warm_starts, scaleFactor, lrscheList,  idxStart, callback, adjust_ab=False):
 
     ## hyperparameters
     learningRate, T0, warmupsteps, gamma = lrscheList[0], lrscheList[1], lrscheList[2], lrscheList[3]
@@ -130,16 +145,14 @@ def treeOptbyGRADwithC(treeDepth, indices_flags_dict, epochNum, X_train, Y_train
     p = X_train.shape[1]
     scale = torch.tensor([scaleFactor], device=device)
     net_placeholder = branchNodeNet(treeDepth, p, scale, None, None, None).to(device, non_blocking=True)
-
     ### initialize weight and bias of net
-    a, b, c = initialize_parameters(idxStart, net_placeholder, warm_starts, X_train, Y_train, device, adjust_ab)
-
+    a, b, c = initialize_parameters(idxStart, net_placeholder, warm_starts, X_train, Y_train, nClass, device, adjust_ab)
     net = branchNodeNet(treeDepth, p, scale, a, b, c).to(device, non_blocking=True)
-
 
     aInit = copy.deepcopy(a)
     bInit = copy.deepcopy(b)
     cInit = copy.deepcopy(c)
+
 
     ## Optimizer 
     optimizer = torch.optim.AdamW(net.parameters(), lr=learningRate)
@@ -164,9 +177,10 @@ def treeOptbyGRADwithC(treeDepth, indices_flags_dict, epochNum, X_train, Y_train
     flags_tensor = indices_flags_dict["D"+str(treeDepth)]["flags_tensor"]
 
 
-    objvMSE_EpochBest = float('inf')
-    r2_EpochBest = float('-inf')
+
+    acc_EpochBest = float('-inf')
     tree_EpochBest = None
+
 
     for epoch in range(epochNum):
 
@@ -174,25 +188,23 @@ def treeOptbyGRADwithC(treeDepth, indices_flags_dict, epochNum, X_train, Y_train
 
         # Forward pass with a batch
         reluBMinuxAx, reluAxMinusB, c_leafLable  = net(X_train)
-        objv = objectiveFuncwithC(scaleFactor, reluBMinuxAx, reluAxMinusB, Y_train, c_leafLable, treeDepth, indices_tensor, flags_tensor, batch_size=17000)
-
-
+        objv = objectiveFuncwithC(scaleFactor, reluBMinuxAx, reluAxMinusB, Y_train, c_leafLable, treeDepth, indices_tensor, flags_tensor, batch_size=60000)
+    
         ## check the real mse loss of the current tree
-        objvMSE_Epoch, r2_Epoch, treeEpoch = callback.CalMSEonEpochEnd(X_train, Y_train, treeDepth, net.linear1, net.c_leafLable)
-        if objvMSE_Epoch < objvMSE_EpochBest:
-            objvMSE_EpochBest = objvMSE_Epoch
-            r2_EpochBest = r2_Epoch
+        acc_Epoch, treeEpoch = callback.CalMSEonEpochEnd(X_train, Y_train, treeDepth, net.linear1, net.c_leafLable)
+        if acc_Epoch > acc_EpochBest:
+            acc_EpochBest = acc_Epoch
             tree_EpochBest = copy.deepcopy(treeEpoch)
-
+    
+    
         # Backward pass and optimize
         objv.backward()
-
-
+    
         optimizer.step()
         scheduler.step()
 
         
-    return objvMSE_EpochBest, r2_EpochBest, tree_EpochBest, aInit, bInit, cInit
+    return acc_EpochBest, tree_EpochBest, aInit, bInit, cInit
 
 
 
@@ -200,9 +212,9 @@ def treeOptbyGRADwithC(treeDepth, indices_flags_dict, epochNum, X_train, Y_train
 
 
 
-def multiStartTreeOptbyGRAD_withC(X_train, Y_train, treeDepth, indices_flags_dict, epochNum, device, warmStarts, startNum, numScale):
+def multiStartTreeOptbyGRAD_withC(X_train, Y_train, treeDepth, nClass, indices_flags_dict, epochNum, device, warmStarts, startNum, numScale):
 
-    objvmin = 1e10
+    accMin = 0
     treeOpt = None
 
 
@@ -222,9 +234,11 @@ def multiStartTreeOptbyGRAD_withC(X_train, Y_train, treeDepth, indices_flags_dic
     ############################################
     
     cartWarmStart = warmStarts[0]
-    treeCART = {"a": torch.tensor(cartWarmStart["a"], device=device), "b": torch.tensor(-cartWarmStart["b"], device=device), "c": torch.tensor(cartWarmStart["c"], device=device)}
-    objvMSECART, r2CART = objv_cost(X_train, Y_train, treeDepth, treeCART)
-    print("objvMSECART in multiStartTreeOpt: {};   r2CART: {}".format(objvMSECART, r2CART))
+    treeCART = {"a": torch.tensor(cartWarmStart["a"], device=device), "b": torch.tensor(-cartWarmStart["b"], device=device), "c": cartWarmStart["c"]}
+    treeCART = update_c(X_train, Y_train, treeDepth, treeCART)
+    accCART = objv_cost(X_train, Y_train, treeDepth, treeCART)
+    print("CART accuracy is {}".format(accCART))
+
 
 
     # callback function
@@ -232,8 +246,9 @@ def multiStartTreeOptbyGRAD_withC(X_train, Y_train, treeDepth, indices_flags_dic
 
 
 
-
     startNum = max(startNum, len(warmStarts))
+    # print("startNum is {}".format(startNum))
+
     for idxStart in range(startNum):
 
         if treeDepth < 4:
@@ -250,66 +265,67 @@ def multiStartTreeOptbyGRAD_withC(X_train, Y_train, treeDepth, indices_flags_dic
 
 
 
-        objvAlp = 1e10
-        r2Alp = 0
+        accAlp = 0
         bestTreeAlp = None
         bestScale = 0
 
-
         warmStarts_cur = [warmStarts[idxStart]] if idxStart < len(warmStarts) else  [None]
-
     
+
         idxCurr = 0
 
         MultiAbFlag = False
         for scaleFactor in scaleList:
 
-            
             if scaleFactor >= 50:
-                if idxStart == 0 and objvAlp >= objvMSECART * 0.999:
+                if idxStart == 0 and accAlp < accCART * 0.999:
                     MultiAbFlag = True
-                elif idxStart != 0 and objvAlp >= objvRandInit * 0.999:
+                elif idxStart != 0 and accAlp < accRandInit * 0.999:
                     MultiAbFlag = True
 
 
-            objvCurr, r2Curr, treeCurrent, aInit, bInit, cInit = treeOptbyGRADwithC(treeDepth, indices_flags_dict, epochNum, X_train, Y_train, device, warmStarts_cur, scaleFactor, lrscheList, idxCurr, callback, MultiAbFlag)
+            accCurr, treeCurrent, aInit, bInit, cInit = treeOptbyGRADwithC(treeDepth, nClass, indices_flags_dict, epochNum, X_train, Y_train, device, warmStarts_cur, scaleFactor, lrscheList, idxCurr, callback, MultiAbFlag)
             
-            print("idx is {}; scaleFactor is {}; objvCurr is {}; r2Curr is {}".format(idxStart, scaleFactor, objvCurr, r2Curr))
+            print("idx is {}; scaleFactor is {}; accCurr is {}".format(idxStart, scaleFactor, accCurr))
+
 
             if idxStart != 0 and scaleFactor == scaleList[0]:
-                objvRandInit, r2RandInit = objv_cost(X_train, Y_train, treeDepth, {"a": aInit, "b": bInit, "c": cInit})
+                treeRandInit = {"a": aInit, "b": bInit, "c": cInit}
+                treeRandInit = update_c(X_train, Y_train, treeDepth, treeRandInit)
+                accRandInit = objv_cost(X_train, Y_train, treeDepth, treeRandInit)
 
 
-            if objvCurr < objvAlp:
-                objvAlp = objvCurr
+            if accCurr > accAlp:
+                accAlp = accCurr
                 bestTreeAlp = copy.deepcopy(treeCurrent)
                 bestScale = scaleFactor
-               
-            if (r2Curr - r2Alp) >= 0.0005:
-                r2Alp =	r2Curr
-            else:
-                if (r2Curr - r2CART) >= 0.01 and idxStart > 1:
-                    break
-                
-            warmStarts_cur.append( {"a": treeCurrent["a"], "b": treeCurrent["b"]* (-1.0), "c": treeCurrent["c"]})                
+
+            if (accCurr - accAlp) < 0.0005:
+                if (accCurr - accCART) >= 0.01 and idxStart > 1:
+                    break   
+
+
+
+            treeCurrentC_onehot = onehot_coding(treeCurrent["c"], device, nClass)    
+            warmStarts_cur.append( {"a": treeCurrent["a"], "b": treeCurrent["b"]* (-1.0), "c": treeCurrentC_onehot})                
 
             idxCurr += 1
 
 
-
-        if objvAlp < objvMSECART:
+        if accAlp > accCART:
             TreeAfterGrad = bestTreeAlp
         else:
             TreeAfterGrad = treeCART
-            objvAlp = objvMSECART
+            accAlp = accCART
         
-        if objvAlp < objvmin:
-            objvmin = objvAlp
+        if accAlp > accMin:
+            accMin = accAlp
             treeOpt = copy.deepcopy(TreeAfterGrad)
 
+        
         print("bestScale is {}; \n".format(bestScale))
     
-    return objvmin, treeOpt
+    return accMin, treeOpt
 
 
 
